@@ -64,13 +64,80 @@ codec: { mode: 'strict', typeSymbol: '…', schema: zodSchema }
 | 插件 | 闸一 | 闸二 | 备注 |
 |---|---|---|---|
 | `dsh-model-fit@0.2.2` | ✅ | ✅ | 已修：2 处 codec 改成 `create: () => …` |
-| `dsh-provider-info@0.16.0` | ✅ | ❌ 8 处 `schema:` | 首个报错 `providerBadge/modelInfo parameter codec` |
-| `dsh-icon-custom@0.8.0` | ✅ | ❌ 10+ 处 `schema:` | `active` 却未崩树，见下 |
+| `dsh-provider-info@0.16.0` | ✅ | ❌ 8 处 `schema:` | 首个报错 `providerBadge/modelInfo parameter codec`；**0.17.0 已修，实测 ✅（4 invocation / 8 codec）** |
+| `dsh-icon-custom@0.8.0` | ✅ | ❌ 11 处 `schema:` | `iconCustom/getStatus result codec`。**0.8.1 / 0.8.2 已修并发布**（7 invocation / 11 codec）。0.8.0 当年是 `latest` —— 坏版本发出去只能靠升版本收场 |
 | `dsh-notify-p@0.1.0` | ✅ | ❌ 2 处 `schema:` | `mailNotify/test result codec` |
 | `dsh-session-title-pro@0.1.0` | ✅ | ❌ | `sessionTitlePro/preview parameter codec` |
 | `dsh-session-failure@0.1.0` | ✅ | ❌ 2 处 `schema:` | `sessionFailure/lastFailures parameter codec` |
 
-**未定论**：`dsh-icon-custom` 闸二 ❌ 且 entry `active`，DSH 一直没崩；而 `dsh-model-fit@0.2.1` 同样条件却崩了整棵树。分界条件尚未定位到——处置立场见 `failure-modes.md`（❌ 一律修，别指望"现在没崩"）。
+### 已定位：闸二失败到底打死了哪一半（`dsh-icon-custom` 复盘）
+
+闸二失败**不会**让插件整个失效，它只打死 **typert RPC 端点**。同一插件里走别的注册途径的宿主副作用照常生效：
+
+- ❌ 死的：`iconCustom/*` 全部 7 个端点（`getStatus`/`setIcon`/`setPwa`/`setLogo`/`resetIcon`/`getUnreadRule`/`setUnreadRule`）→ 设置页读不到状态、上传/重置/开关全部无反应。
+- ✅ 活的：`ctx.webServer.register` 注册的 HTTP 路由（`/icon-custom.svg`、`/manifest.webmanifest`、派生 PNG）与 `tapIndex` 头部改写（都不经 typert）→ 已保存的图标**继续照常服务**。
+
+所以"图标还能显示、但设置页点了没反应"正是静默失效的指纹，别因为 HTTP 路由 200 就以为插件是好的。
+
+**未定论（部分收窄）**：`dsh-icon-custom` 闸二 ❌ 且 entry `active`，DSH 一直没崩；而 `dsh-model-fit@0.2.1` 同样条件却崩了整棵树。读 `typert-loader` 的 `apply()` 可见分界**应当**是"该 entry 在 loader 激活那一轮扫描时是否已在 `ctx.loader.entries()` 里"：在 → `await Promise.all(flush())` 收进 `failures` → 抛 `AggregateError`（崩树）；在那之后才挂载 → 走 `ctx.on("internal/plugin")` 的微任务分支 → 只 `ctx.logger.error`（contained）。**但这条尚未经受控实验证实**（两个插件都是 bundle entry，为何走了不同分支仍未解释）。处置立场不变：❌ 一律修。钉死它仍要靠 `upgrade-runbook.md` 第 4 步的 scratch profile 实验。
+
+### 第三类失败：闸一闸二都过，客户端 API 漂移（两闸都抓不到）
+
+`dsh-icon-custom` 0.8.1 两闸全过，但"红点点开不消失"依旧。原因是**客户端半边**（`client/client.js`，跑在浏览器里）读了 0.2.x 已经不存在的东西。**体检脚本与两道闸都管不到客户端，这类只能逐个 prop / 逐个服务方法核对。**
+
+同一个插件里一次抓到三处（升级前都在 0.1.x 存在）：
+
+| 插件用了 | 0.2.x 实际 | 症状 | 0.2.x 正确写法 |
+|---|---|---|---|
+| `list.current`（会话列表快照） | 快照**只有** `ids` / `byId` / `phase` / `projectionsBySession`（两处写入点实测确认） | 已读水位线永不写入 → **红点点开也不消失** | `Object.values(state.byId).find(s => (s.retainedBy.mainView ?? 0) > 0)?.id` |
+| `props.useSessionPendingInteraction` | **全仓 0 匹配**，没有任何地方提供它 | "在等你"那半**从未生效**（静默降级） | `props.useSessionStatus`（map 的值带 `pendingInteraction`，另有官方的 `completionUnread`） |
+| `ctx.sessions.open(id)` | `ClientSessions` 没有导航方法 | 待处理列表点进去**不跳转** | `ctx.uiWorkspace.openSession(id)`（ui-chat 就这么写）；用 `ctx.get("uiWorkspace")?.…` 可选查找，别加硬依赖 |
+
+核对方法（`workflow.md` 第 4 步的具体化）：
+
+```bash
+DSH=/usr/local/lib/node_modules/@deepseek-ai/dsh
+# ① 插件用到的每个 prop 名，在运行时里数匹配数；0 = 没人提供
+grep -rc "useSessionPendingInteraction" "$DSH/node_modules/@deepseek-ai"/*/lib/client.js | grep -v ":0"
+# ② 判断"该服务有没有这个方法"，要看**类源码的方法列表**，不要只看 inspect 的方法表
+#    方法表并不穷尽（它没列 list，官方却在用 ctx.sessions.list.getSnapshot()）
+grep -n "= class" "$DSH/node_modules/@deepseek-ai/dsh-api-session-controller/lib/client.js"
+# ③ "官方怎么干这件事"最可靠：搜官方插件里的同类调用
+grep -rn "uiWorkspace.openSession\|source: \"mainView\"" "$DSH/node_modules/@deepseek-ai"/*/lib/client.js
+```
+
+### 第四类：DSH 自己的页面结构变了（两闸 + prop 全过，仍不生效）
+
+`dsh-icon-custom` 修完闸二和三处 prop 漂移后，"替换图标"在**浅色模式**下依然完全不生效——真凶是 DSH 0.2.x 的 `index.html` 内置了**两条** `<link rel="icon">`：
+
+```html
+<link rel="icon" type="image/svg+xml" href="./favicon-dark.svg" media="(prefers-color-scheme: dark)" />
+<link rel="icon" type="image/svg+xml" href="./favicon.svg"      media="(prefers-color-scheme: light)" />
+```
+
+插件两端都只处理 `document.querySelector` 拿到的**第一条**：宿主 `_rewriteIndex` 用**非全局**正则只替换了 dark 那条，light 那条仍是内置 favicon；客户端 `iconLink`/`applyLive`/`applyDefault` 同样只认第一条。而浏览器取「**最后一个**合适候选」→ **浅色模式下内置图标反杀**。
+
+> **指纹：深色模式正常、浅色模式不生效**（或反之）。看到这种"按配色一半好一半坏"，先怀疑插件只处理了多条同类标签中的一条。
+
+判据（直接看真实产物，不要靠记忆）：
+
+```bash
+DSH=/usr/local/lib/node_modules/@deepseek-ai/dsh
+grep -o '<link[^>]*rel="icon"[^>]*>' "$DSH/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html"
+# 改写对不对，也要拿真实 index.html 跑一遍真实函数（大括号配对 eval 出来），别只看代码：
+#   断言"改写后只剩 1 条、无 media、href 指向自定义图标"
+```
+
+**三条教训**（都踩过）：
+
+1. `index.html` 是 DSH 的产物，升级会变结构。对它做字符串改写（`tapIndex`）或对 head 做 DOM 操作的插件，一律**按"可能有多条"写**（`replace` 用 `/g`，`querySelectorAll` 而不是 `querySelector`）。
+2. 插件若承诺"无自定义图标时零副作用"，那条分支必须**还原原始标签**（记住每条的 `href`/`type`/`media` 再放回去），而不是把多条统一改成一个 href——否则深色模式那个图标会被静默改掉。
+3. 写入要**幂等**（值相同就别写）：head 上的 `MutationObserver` 会回调 `reconcileFavicon`，冗余写入会让看门狗自激。
+
+两个操作细节：
+
+- `cordis_inspect_query`(client, …) 在**浏览器页面没连上**时会报 `no connected Harness page`——不代表插件坏了，重开页面再试。
+- 客户端的修复**必须刷新页面**才生效（宿主修复要重启）——两者是两次独立的加载。
 
 ## 判"插件到底挂载没有"的正确信号
 
