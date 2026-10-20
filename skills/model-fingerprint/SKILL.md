@@ -1,133 +1,175 @@
 ---
 name: model-fingerprint
-description: 单模型手动模式的「随机整数指纹」检测，判定模型真实版本。参考库 https://lm.ikale.io；不需要 API key，不修改任何配置。
-whenToUse: 用户想确认某一个模型是否为宣称的版本（例如 deepseek-v4.1-flash 是否 1017）、怀疑中转降智或换模型，或直接说"测一下这个模型"。
+description: 用官方 CLI（lmfpd）对某个 API 端点做「随机整数指纹」检测，判定背后模型。文档 https://lm.ikale.io/docs/cli/detect/ ；默认一口气跑完并给结论。
+whenToUse: 用户想确认某个模型/中转端点是否为宣称版本（如 deepseek-v4.1-flash 是否 1017）、怀疑降智或换模型，或直接说"用 CLI 测一下这个模型"。
 user-invocable: true
 ---
 
-# 模型指纹检测 · 单模型手动模式
+# 模型指纹检测 · CLI 模式
 
-参考库与网页版：<https://lm.ikale.io>
+官方文档：<https://lm.ikale.io/docs/cli/detect/>
+原理：让模型凭第一反应写 300 个左右的 1–355 整数，模型对数值/区间/末位的偏好就是指纹，与参考库（60 个模型）比对得出候选。
 
-原理：让模型凭第一反应写约 300 个 1–355 的整数。语言模型的"随机"并不均匀，每个模型偏向的数值、区间和末位相对稳定，这些偏好构成指纹。把三段回复与参考库（60 个模型）比对，就能看出最接近的候选。
+CLI 与网页共用同一份检测器和参考库；区别只是请求从终端发出、打分在本地完成。
 
-**范围**：一次只测一个模型。**不需要 key，不调用被测接口，不改配置。**
+## 铁律
 
-## 流程总览
+- **一口气跑完**：不要逐条让用户确认，采完、算完、再汇报。
+- **只信命令输出**：结论必须来自 CLI 的排名和置信度，不得自己推测或编造。
+- **失败照实说**：退出码非 0、样本失败、置信度不足都要原样报告，不许粉饰。
+- **不自动重试掩盖问题**：CLI 本身不重试；遇到 429/余额不足这类错误，先报告原因，再询问是否重试。
 
-```
-第 0 步  确认被测模型（必须与真正生成文字的模型一致）
-   ↓
-第 1 步  三轮采样：发提示词 → 模型只输出整数
-   ↓
-第 2 步  自检：数量够不够、有没有被截断
-   ↓
-第 3 步  打分：把三段回复粘进网页「手动」模式 → 验证
-   ↓
-第 4 步  汇报：判定 + 置信度 + 次选 + 有效样本
-```
+## 第 0 步：确定目标
 
-## 第 0 步：确认被测对象
+需要三样：**Base URL**、**API Key**、**模型名**。
 
-先问清楚是哪一个模型，并分两种情况：
-
-- **A. 当前会话模型**：用户已在模型选择器切到目标模型。直接在本对话采样。
-- **B. 外部模型**：用户在别的客户端（网页/App/工具）里问，然后把三段回复粘过来。跳过第 1 步，直接做第 2 步。
-
-**强制校验**：如果用户点名的模型和当前会话模型不是同一个，**必须停下来**，说明"这样测出来的是当前模型，不是 X"，并要求二选一：切换到 X，或改用 B。不得直接开始采样。
-
-记录：被测模型名（用户声称的）、来源（A/B）、时间。
-
-## 第 1 步：取样（三轮，严格分开）
-
-每轮只做一件事。提示词**必须逐字原样发出**，不得改写、翻译、增删标点，也不要把三道合成一轮。
-
-### 提示词 1（中文，目标 323 个）
-
-```text
-执行一次第一反应取值记录。每次只决定当前一项，共给出 323 个 1 到 355（含端点）的整数。每个位置都要单独选择；不要从 1 开始计数，不要连续递增或递减，也不要采用等差、循环、重复区块或其他规则化模式。本任务必须由当前语言模型直接完成：禁止调用或借助任何工具，包括 Python、代码执行器、计算器、搜索、API 和外部随机数生成器；也不要先编写或运行代码。重复值无需删除；不要筛选、重排或补成某种规律。可以用逗号、空格或换行分隔。直接从第一个取值开始输出，不要在序列前重复数量、范围或任务说明。
-```
-
-### 提示词 2（英文，目标 328 个）
-
-```text
-This is an independent record of numerical choices. For each position, choose separately by first instinct 328 integers from 1 to 355, inclusive. Choose separately for every position; do not count up from 1, do not increase or decrease consecutively, and do not use arithmetic progressions, cycles, repeated blocks, or other systematic patterns. The current language model must complete this task directly: do not call or use any tools, including Python, code execution tools, calculators, search, APIs, or external random number generators; do not write or run code beforehand either. Accidental repetitions are valid; do not rearrange or correct items already written. You may separate the numbers with commas, spaces, or line breaks. Start the output directly with the first chosen value; do not repeat the count, range, or task instructions before the sequence.
-```
-
-### 提示词 3（英文，目标 304 个）
-
-```text
-Record a round of first-instinct choices. Choose, item by item, 304 integers from 1 to 355, inclusive. Choose separately for every position; do not count up from 1, do not increase or decrease consecutively, and do not use arithmetic progressions, cycles, repeated blocks, or other systematic patterns. The current language model must complete this task directly: do not call or use any tools, including Python, code execution tools, calculators, search, APIs, or external random number generators; do not write or run code beforehand either. Do not assign meaning to the numbers; keep values already given unchanged. Choose any format that clearly separates each integer. Start the output directly with the first chosen value; do not repeat the count, range, or task instructions before the sequence.
-```
-
-### 执行节奏
-
-1. 发出提示词 1，等用户回复「开始」。
-2. 回复里**只输出整数**：不要前言、不要解释、不要编号、不要追问。
-3. 同样完成提示词 2、3，每轮单独一条消息。
-
-> 需要换一组题：打开 <https://lm.ikale.io> → 检测 → 手动 → 「换一组提示词」，把新三组原样替换上面对应文本。
-
-## 第 2 步：自检有效样本
-
-对每段回复检查：
-
-- 有效整数数 ≥ `max(80, ceil(0.55 × 目标数))`：323 → 178、328 → 181、304 → 168；
-- 回复自然结束，没有被截断；
-- 数值都在 1–355 内。
-
-不合格就**重采这一条**，不要用脚本补数字、不要删改已有序列。
-
-## 第 3 步：打分（网页手动模式）
-
-1. 打开 <https://lm.ikale.io>，停在「检测」页，右上角选 **手动**。
-2. 页面会给出样本 1/2/3 三个框：把三段回复分别粘进对应框（左下角会显示解析到的数字个数，应与目标数接近）。
-3. 点右下角 **验证**。
-4. 读取结果区：**排名第一的候选 + 置信度**，以及下面的候选列表。
-
-网页在本地计算，粘贴的数字不会上传，也不需要登录或 key。
-
-### 可选：离线打分
-
-如果用户希望留档或批量复算，可以把三段回复写入 JSON 后离线跑（同样不联网、不用 key）：
+- 用户直接给了 → 直接用。
+- 用户在 DSH 里已经配过 → 从 DSH 凭据库按引用名取，例如 `WB_ML_API_KEY`、`OPENCODE_GO_API_KEY`、`CMD_01_API_KEY`；端点取对应 provider 的 `baseURL`。
+- 从 `~/.dsh/.credentials.yaml` 的 `refs` 段读取，**不要打印明文**：
 
 ```bash
-bunx lmfpd@latest --input /tmp/fpd-manual.json --json
+KEY=$(python3 -c "import yaml;print(yaml.safe_load(open('$HOME/.dsh/.credentials.yaml'))['refs']['WB_ML_API_KEY'])")
 ```
 
-JSON 形如 `[{"text":"...","expected_count":323}, ...]`。
+- 用户点名的模型和实际要请求的端点不一致时，停下来确认一次。
 
-## 第 4 步：汇报
+## 第 1 步：跑检测
+
+### 标准命令（推荐：走包装脚本）
+
+Key 不进 argv，包装脚本在运行时从凭据库读取并经 `API_KEY` 环境变量传给 CLI：
+
+```bash
+.dsh/skills/model-fingerprint/scripts/fpd-run.sh <凭据引用> <BASE_URL> <MODEL> \
+  -a chatcompletion --count 3 --parallel 3
+```
+
+例：
+
+```bash
+.dsh/skills/model-fingerprint/scripts/fpd-run.sh \
+  WB_ML_API_KEY http://127.0.0.1:9001/v1 deepseek-v4.1-flash --count 3
+```
+
+脚本行为：
+
+- 从 `~/.dsh/.credentials.yaml` 的 `refs` 段按名字取 Key，读不到就报错退出；
+- `export API_KEY=...` 后 `exec`，Key 不落命令行、不进 shell history；
+- 自动加 `--no-update-check`，默认 `--output /tmp/fpd-<凭据引用>.json`；
+- `--dry-run` 只打印将执行的命令，Key 显示为 `sk-***`。
+
+### 兜底命令（不用脚本时）
+
+```bash
+KEY=$(python3 -c "import yaml;print(yaml.safe_load(open('$HOME/.dsh/.credentials.yaml'))['refs']['WB_ML_API_KEY'])")
+API_KEY="$KEY" bunx lmfpd@latest -b <BASE_URL> -m <MODEL> -a cc --count 3 --no-update-check
+```
+
+**不要**写成 `-k "$KEY"`：展开后 Key 会出现在进程命令行里。
+
+- `npx lmfpd@latest` 等价；本机有 bun 时 `bunx` 更快。
+- `-a`：OpenAI 兼容用 `chatcompletion`（或 `cc`）；`/v1/messages` 用 `message`；官方/Responses 端点用默认的 `responses`。
+- `-b` 只写主机名时自动补 `/v1`；带路径则保留路径再追加端点。
+- 默认已是 SSE、宽松模式、3 样本、3 并发、1 轮，显式写上便于复现。
+
+### 命令超时
+
+单次检测通常 1–4 分钟（本地代理端点可能更慢）。用后台任务跑，别让前台命令超时：
+
+```bash
+bunx lmfpd@latest ... > /tmp/fpd.log 2>&1
+```
+
+或交给宿主的长任务机制。
+
+### 常用变体
+
+```bash
+# 多轮复测（5 轮）
+... -n 5
+
+# 严格模式：要求三条完整有效回答，不允许自动截断
+... -s
+
+# 少发请求：每轮 1 条（只给排名，没有置信度）
+... --count 1
+
+# 关闭流式
+... -ns --timeout 180
+
+# 附带分词器探测（约多发 12 个请求，按请求计费的接口会额外花钱）
+... --tokenizer
+
+# 机器可读输出
+... --json
+```
+
+## 第 2 步：读结果
+
+终端里关键区块：
 
 ```
-被测模型：<用户声称的名字>
-判定：<第一名>
-置信度：98.6%（库内相对概率）
-次选：<第二名> 1.4%
-有效样本：323/323、328/328、304/304
+LEADING CANDIDATES
+ #   Model                       Score  Confidence
+ 1   deepseek-v4.1-flash-1017    2.823       98.8%
+ 2   deepseek-v4.1-flash         1.854        0.9%
 ```
 
-必须同时说明：
+判定规则：
 
-- 置信度是**参考库内 60 个模型之间的相对概率**，不是"真货概率"；
-- 命中同名只是支持证据，不能单独证明身份；
-- 库外模型无法识别，会被归到最近的候选；
-- 一次检测只反映当下，间歇性替换测不出来。
-
-## 硬性禁止
-
-- 生成数字时**不能调用任何工具**（含 run_code、bash、python），也不能用脚本随机数冒充。
-- 不得改写提示词、不得改变目标数量。
-- 不得在数字前后添加解释，否则会影响解析。
-- 不得把三个样本合并成一条回复。
-- 不得在未确认模型的情况下给出"某模型 = 某指纹"的结论。
-
-## 故障排查
-
-| 现象 | 处理 |
+| 情况 | 结论 |
 |---|---|
-| 数字不足 | 该条重采；确认模型没有被输出长度限制 |
-| 「不像语言模型的回答」 | 数字是程序生成/排序过的，重采 |
-| 「分布异常」 | 该提示词触发了异常分布，换一组提示词重测 |
-| 三段都失败 | 换更小目标数（304）或换提示词 |
-| 无法打开网页 | 用可选离线路径打分 |
+| 三条样本有效、校准匹配 | **Calibrated ranking**，可报置信度 |
+| 只有 1–2 条有效 | 只报排名，**不要报置信度** |
+| 校准不匹配 | **Uncalibrated ranking**，置信度不可用 |
+| 前两名相差 < 15 个百分点 | 判「库内无法区分」，建议换题/多轮重测 |
+| 标记 `Not a model reply` | 数字不像模型产出，重采 |
+| 某样本提示分布异常 | 该轮结果不可靠，换题重测 |
+
+置信度 = **参考库 60 个模型之间的相对概率**，不是"真货概率"；命中同名只是支持证据，不能单独证明身份；库外模型识别不了，会归到最近候选。
+
+## 第 3 步：离线复算（可选）
+
+已有报告时不需要再请求模型：
+
+```bash
+bunx lmfpd@latest --input /tmp/fpd-<名字>.json --json
+```
+
+也接受纯文本数组：`[{"text":"...","expected_count":323}, ...]`。
+
+## 第 4 步：汇报模板
+
+```
+被测端点：<Base URL>
+被测模型：<MODEL>
+判定：<第一名>
+置信度：98.8%（库内相对概率）
+次选：<第二名> 0.9%
+样本：323/323、328/328、304/304，3/3 有效
+耗时：<秒>
+报告：/tmp/fpd-<名字>.json
+```
+
+不可判定时写清楚：前两名分别是谁、相差多少、建议怎么重测。
+
+## 故障处理
+
+| 现象 | 含义 | 处理 |
+|---|---|---|
+| 退出码 0 | 所有轮次都给出排名 | 正常 |
+| 退出码 1 | 输入无效或有轮次未评分 | 看日志，定位具体样本失败原因 |
+| 退出码 130 / 143 | 用户取消 / SIGTERM | 报告已保存的样本 |
+| `401` / `403` | Key 不对、缺 header、被 Cloudflare 拦 | 核对凭据，注意有的网关要求额外 session 头，CLI 无法自定义 header，需自建转发代理 |
+| `429` | 上游限流 | 报告冷却时间，等够再跑；可把 `--parallel` 降到 1 |
+| `400 insufficient credits` | 账户欠费 | 直接报告，不要换模型硬试 |
+| 模型返回空 | 推理吃满输出预算 | 该样本重采；或换更短的目标数 |
+| `bunx`/网络不可用 | 无法下载 CLI | 改用网页手动模式 |
+
+## 凭据安全
+
+- Key 只经环境变量传入（`API_KEY`），**不要用 `-k` 把明文放进命令行**，也不要 echo 或写进报告。
+- `--output` 的报告经实测不含凭据，可以安全保留。
+- 不要把 Key 发到 lm.ikale.io：CLI 的判断全在本地，不联网到该站点。
+- CLI 唯一无关外联是更新检查（npm 三个镜像，只 GET 版本号，不带凭据）；`--no-update-check` 可彻底关掉。
+- 磁盘层面：凭据文件是明文、权限 0600。若 FileVault 未开启，建议开启。
