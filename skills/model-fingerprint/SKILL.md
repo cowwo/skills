@@ -138,7 +138,50 @@ bunx lmfpd@latest --input /tmp/fpd-<名字>.json --json
 
 也接受纯文本数组：`[{"text":"...","expected_count":323}, ...]`。
 
-## 第 4 步：汇报模板
+## 第 4 步：性能记录（顺手，零额外请求）
+
+`--output` 保存的报告（默认 `/tmp/fpd-<凭据引用>.json`）里已经带有计时数据，直接读，不要再请求模型：
+
+| 指标 | 取法 | 说明 |
+|---|---|---|
+| 模型用时 | 每个样本 `finishedAt − startedAt`，先求和再求平均 | 单次请求从发出到结束 |
+| 首 token 平均（TTFT） | 有 `throughput` 的样本，取 `ttftMs` 求平均 | 到首个「可见输出文本块」的耗时，不是首字节（首字节另记在 `firstByteMs`） |
+| 输出速度（TPS） | 有 `tokensPerSecond` 的样本求平均 | token 数优先用接口 `usage`；`estimated: true` 表示按字符估算，汇报时加 `≈` |
+| 工具调用用时 | 跑 lmfpd 这条命令的墙钟耗时（开始/结束时间差） | lmfpd 检测过程不发起工具调用，这个数记的是本次命令本身的总耗时 |
+
+口径：
+
+- 失败样本没有 `throughput`，不参与 TTFT/TPS 平均，但在模型用时里如实计入；
+- TPS 需满足流事件 ≥ 4、生成窗口 ≥ 250ms、token ≥ 16 才输出，条件不够就写「不可用」；
+- 宽松模式拿够数字会提前截断（Capped），TPS 只算到截断点，汇报时标注；
+- 数值缺失一律写「不可用」，不要填 0。
+
+提取命令（只读报告、不联网；把路径换成实际报告）：
+
+```bash
+node -e '
+const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const s = r.rounds.flatMap(x => x.samples || []);
+const timed = s.filter(x => x.startedAt && x.finishedAt);
+const sum = timed.reduce((a, x) => a + (x.finishedAt - x.startedAt), 0);
+const t = s.map(x => x.throughput).filter(Boolean);
+const avg = v => v.length ? v.reduce((a, x) => a + x, 0) / v.length : null;
+const tps = t.map(x => x.tokensPerSecond).filter(x => typeof x === "number");
+console.log(JSON.stringify({
+  model_sum_s: +(sum / 1000).toFixed(2),
+  model_avg_s: timed.length ? +(sum / timed.length / 1000).toFixed(2) : null,
+  ttft_avg_ms: avg(t.map(x => x.ttftMs)),
+  tps_avg: avg(tps),
+  estimated: t.some(x => x.estimated),
+  samples: s.length,
+  with_throughput: t.length
+}, null, 1));
+' /tmp/fpd-<凭据引用>.json
+```
+
+想要更稳的平均值，用 `-n 3` 多跑几轮（会多花钱），再合并所有轮次的样本计算。
+
+## 第 5 步：汇报模板
 
 ```
 被测端点：<Base URL>
@@ -147,7 +190,10 @@ bunx lmfpd@latest --input /tmp/fpd-<名字>.json --json
 置信度：98.8%（库内相对概率）
 次选：<第二名> 0.9%
 样本：323/323、328/328、304/304，3/3 有效
-耗时：<秒>
+模型用时：合计 <X>s / 平均 <Y>s
+首 token 平均（TTFT）：<Z>s
+输出速度（TPS）：<N> tok/s（估算时加 ≈）
+工具调用用时：<W>s（lmfpd 命令墙钟）
 报告：/tmp/fpd-<名字>.json
 ```
 
